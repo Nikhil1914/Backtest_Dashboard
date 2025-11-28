@@ -2,17 +2,17 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import datetime as dt
+import calendar
 
 from fyers_apiv3 import fyersModel
 import plotly.express as px
 
 # ========================= FYERS SETUP =========================
 
-# Make sure access.txt contains your access token (APPID:token)
+# access.txt should contain your Fyers access token: "APPID:access_token"
 with open("access.txt", "r") as a:
     access_token = a.read().strip()
 
-# Put your client_id here
 client_id = "KB4YGO9V7J-100"  # change if needed
 
 fyers = fyersModel.FyersModel(
@@ -139,12 +139,12 @@ def add_moving_averages(df, ma_type, fast_period, slow_period):
         (df["fast_ma"] > df["slow_ma"])
         & (df["fast_ma"].shift(1) <= df["slow_ma"].shift(1)),
         "signal_raw",
-    ] = 1  # bullish crossover
+    ] = 1  # bullish
     df.loc[
         (df["fast_ma"] < df["slow_ma"])
         & (df["fast_ma"].shift(1) >= df["slow_ma"].shift(1)),
         "signal_raw",
-    ] = -1  # bearish crossover
+    ] = -1  # bearish
 
     return df
 
@@ -182,19 +182,15 @@ def backtest_ma_crossover(
 ):
     """
     Returns:
-        trades_df: per-trade results with Entry/Exit time, prices, PnL etc.
-    Logic:
-        - Long only
-        - Entry at bar open after bullish crossover
-        - Exit at TP/SL or on crossover in opposite direction
-        - No overnight: exit on day change at prev bar close
+        trades_df: per-trade results with Entry/Exit time, prices, PnL points etc.
+    Long-only, intraday (no overnight).
     """
     if df.empty:
         return pd.DataFrame()
 
     df = df.copy().sort_index()
 
-    # Filter to regular session (intraday)
+    # NSE session filter
     df = df.between_time("09:15", "15:30")
     if df.empty:
         return pd.DataFrame()
@@ -210,8 +206,6 @@ def backtest_ma_crossover(
     sl_price = None
     trade_date = None
 
-    prev_row = None
-
     for i in range(1, len(df)):
         row = df.iloc[i]
         prev_row = df.iloc[i - 1]
@@ -220,7 +214,7 @@ def backtest_ma_crossover(
 
         signal_prev = prev_row["signal_raw"]
 
-        # Exit on day change (no overnight)
+        # Exit on day change
         if in_trade and ts.date() != trade_date:
             exit_price = prev_row["Close"]
             exit_time = prev_ts
@@ -240,7 +234,7 @@ def backtest_ma_crossover(
             in_trade = False
             entry_price = entry_time = tp_price = sl_price = trade_date = None
 
-        # Manage open trade: check SL/TP on current bar
+        # manage open trade: SL / TP
         if in_trade:
             bar_high = row["High"]
             bar_low = row["Low"]
@@ -250,7 +244,7 @@ def backtest_ma_crossover(
                 hit_sl = bar_low <= sl_price
 
                 if hit_sl and hit_tp:
-                    exit_price = sl_price  # conservative
+                    exit_price = sl_price
                     exit_reason = "SL&TP same bar (SL priority)"
                 elif hit_tp:
                     exit_price = tp_price
@@ -320,11 +314,16 @@ def backtest_ma_crossover(
 
 # =================== BACKTEST RESULTS HELPERS ===================
 
-def compute_equity_from_pnl(bt_df, initial_capital=100000, pnl_col="pnl"):
+def compute_equity_from_money_pnl(bt_df, initial_capital=100000, pnl_col="pnl_money"):
+    """
+    bt_df[pnl_col]: money PnL per bar (₹).
+    Equity = initial_capital + cumulative PnL.
+    """
     df = bt_df.copy()
-    ret = df[pnl_col].fillna(0.0)
-    equity_curve = initial_capital * (1 + ret).cumprod()
+    pnl = df[pnl_col].fillna(0.0)
+    equity_curve = initial_capital + pnl.cumsum()
     equity_curve.name = "Equity"
+
     daily_equity = equity_curve.resample("1D").last().dropna()
     daily_equity.name = "Equity"
     return equity_curve, daily_equity
@@ -339,6 +338,7 @@ def daily_pnl_from_equity(daily_equity):
 def summarize_backtest(trades_df, daily_equity, initial_capital=100000, trading_days_per_year=252):
     summary = {}
 
+    # equity-level stats
     if len(daily_equity) > 1:
         total_return = daily_equity.iloc[-1] / daily_equity.iloc[0] - 1.0
         n_days = (daily_equity.index[-1] - daily_equity.index[0]).days
@@ -362,9 +362,10 @@ def summarize_backtest(trades_df, daily_equity, initial_capital=100000, trading_
     summary["Sharpe"] = sharpe
     summary["MaxDD_pct"] = max_dd * 100 if not np.isnan(max_dd) else np.nan
 
-    if not trades_df.empty:
-        n_trades = len(trades_df)
+    # trade-level stats using GrossReturn (decimal on capital)
+    if not trades_df.empty and "GrossReturn" in trades_df.columns:
         gross_ret = trades_df["GrossReturn"]
+        n_trades = len(gross_ret)
         wins = (gross_ret > 0).sum()
         losses = (gross_ret < 0).sum()
         win_rate = wins / n_trades * 100.0
@@ -399,13 +400,12 @@ def main():
 
     st.sidebar.header("Strategy & Market Settings")
 
-    # -------- Strategy selector (more can be added later) --------
     strategy = st.sidebar.selectbox("Select Strategy", ["EMA Crossover"])
 
-    # ---- Shared high-level settings ----
-    initial_capital = st.sidebar.number_input("Initial Capital", value=100000, step=5000)
+    # shared settings
+    initial_capital = st.sidebar.number_input("Initial Capital (₹)", value=100000, step=5000)
+    lot_size = st.sidebar.number_input("Lot size / Quantity per trade", value=50, step=1, min_value=1)
 
-    # ===== EMA CROSSOVER STRATEGY UI =====
     if strategy == "EMA Crossover":
         segment = st.sidebar.selectbox(
             "Segment",
@@ -436,7 +436,8 @@ def main():
             )
             month = st.sidebar.selectbox(
                 "Month",
-                ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"],
+                ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+                 "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"],
                 index=dt.date.today().month - 1,
             )
             if "Weekly" in segment:
@@ -449,7 +450,6 @@ def main():
         else:
             st.sidebar.markdown("**Note:** No expiry/strike required for Index/Equity.")
 
-        # Date range & resolution
         min_date = dt.date(2017, 7, 3)
         max_date = dt.date.today()
         start_date = st.sidebar.date_input(
@@ -468,7 +468,7 @@ def main():
         resolution = st.sidebar.selectbox(
             "Resolution (Timeframe)",
             ["1", "2", "3", "5", "10", "15", "20", "30", "60", "120", "240", "D"],
-            index=9,  # 60m default
+            index=9,  # 60m
         )
 
         st.sidebar.markdown("---")
@@ -476,8 +476,8 @@ def main():
 
         ma_type = st.sidebar.selectbox("MA Type", ["SMA", "EMA"], index=1)
         period_options = [5, 8, 9, 10, 13, 20, 21, 34, 50, 100, 200]
-        fast_period = st.sidebar.selectbox("Fast MA Period", period_options, index=2)  # 9
-        slow_period = st.sidebar.selectbox("Slow MA Period", period_options, index=6)  # 50/100/200 etc.
+        fast_period = st.sidebar.selectbox("Fast MA Period", period_options, index=2)
+        slow_period = st.sidebar.selectbox("Slow MA Period", period_options, index=6)
 
         if slow_period <= fast_period:
             st.sidebar.warning("Slow period should be greater than fast period.")
@@ -494,7 +494,6 @@ def main():
         st.sidebar.markdown("---")
         run_bt = st.sidebar.button("🚀 Run EMA Crossover Backtest")
 
-        # ===== MAIN CONTENT AREA =====
         if start_date > end_date:
             st.error("Start date must not be after end date.")
             return
@@ -526,45 +525,45 @@ def main():
                     st.warning("No trades generated with selected parameters.")
                     return
 
-                # Build per-bar pnl series: assign trade return at exit bar only
+                # ========= Convert PnL points to money using lot size =========
+                trades_df["MoneyPnL"] = trades_df["PnL Points"] * lot_size
+                trades_df["GrossReturn"] = trades_df["MoneyPnL"] / initial_capital  # decimal on capital
+
+                # Build per-bar money PnL series (₹)
                 pnl_series = pd.Series(0.0, index=price_df.index)
                 for _, tr in trades_df.iterrows():
                     exit_time = tr["Exit Time"]
                     if exit_time in pnl_series.index:
-                        pnl_series.loc[exit_time] += tr["Return %"] / 100.0
+                        pnl_series.loc[exit_time] += tr["MoneyPnL"]
 
-                bt_df = pd.DataFrame({"pnl": pnl_series}, index=price_df.index)
+                bt_df = pd.DataFrame({"pnl_money": pnl_series}, index=price_df.index)
 
-                # For summary functions, we expect GrossReturn in decimal
-                trades_stats_df = trades_df.copy()
-                trades_stats_df["GrossReturn"] = trades_stats_df["Return %"] / 100.0
-
-                equity_curve, daily_equity = compute_equity_from_pnl(
-                    bt_df, initial_capital=initial_capital, pnl_col="pnl"
+                equity_curve, daily_equity = compute_equity_from_money_pnl(
+                    bt_df, initial_capital=initial_capital, pnl_col="pnl_money"
                 )
                 daily_df = daily_pnl_from_equity(daily_equity)
-                summary = summarize_backtest(trades_stats_df, daily_equity, initial_capital)
+                summary = summarize_backtest(trades_df, daily_equity, initial_capital)
 
             # ===================== DASHBOARD LAYOUT =====================
 
-            total_pnl = equity_curve.iloc[-1] - equity_curve.iloc[0]
+            total_pnl_money = equity_curve.iloc[-1] - equity_curve.iloc[0]
             max_dd_pct = summary["MaxDD_pct"]
 
             col_p1, col_p2 = st.columns([3, 1])
             with col_p1:
                 st.subheader(f"EMA Crossover Backtest – {fyers_symbol}")
-                st.caption(f"{start_date} → {end_date}")
+                st.caption(f"{start_date} → {end_date} | Lot size: {lot_size}")
 
                 fig_eq = px.line(
                     equity_curve,
-                    labels={"value": "Equity", "index": "Time"},
-                    title=f"Equity Curve (Initial: {initial_capital:,.0f})",
+                    labels={"value": "Equity (₹)", "index": "Time"},
+                    title=f"Equity Curve (Initial: ₹{initial_capital:,.0f})",
                 )
                 st.plotly_chart(fig_eq, use_container_width=True)
 
             with col_p2:
                 st.markdown("### P&L & Drawdown")
-                st.metric("P&L", f"{total_pnl:,.2f}")
+                st.metric("Total P&L (₹)", f"{total_pnl_money:,.2f}")
                 st.metric(
                     "Max Drawdown (%)",
                     f"{max_dd_pct:.2f}" if not np.isnan(max_dd_pct) else "NA",
@@ -580,10 +579,10 @@ def main():
             win_days = (daily_df["DayPnL"] > 0).sum()
             loss_days = (daily_df["DayPnL"] < 0).sum()
 
-            win_trades = (trades_stats_df["GrossReturn"] > 0).sum()
-            loss_trades = (trades_stats_df["GrossReturn"] < 0).sum()
-            max_profit = daily_df["DayPnL"].max()
-            max_loss = daily_df["DayPnL"].min()
+            win_trades = (trades_df["GrossReturn"] > 0).sum()
+            loss_trades = (trades_df["GrossReturn"] < 0).sum()
+            max_profit_day = daily_df["DayPnL"].max()
+            max_loss_day = daily_df["DayPnL"].min()
             avg_per_day = daily_df["DayPnL"].mean()
 
             c1, c2, c3, c4 = st.columns(4)
@@ -609,55 +608,75 @@ def main():
                     else "NA",
                 )
             with c4:
-                st.metric("Max Profit (Day)", f"{max_profit:,.2f}")
-                st.metric("Max Loss (Day)", f"{max_loss:,.2f}")
-                st.metric("Avg P&L / Day", f"{avg_per_day:,.2f}")
+                st.metric("Max Profit (Day, ₹)", f"{max_profit_day:,.2f}")
+                st.metric("Max Loss (Day, ₹)", f"{max_loss_day:,.2f}")
+                st.metric("Avg P&L / Day (₹)", f"{avg_per_day:,.2f}")
 
             st.markdown("---")
 
-            # ===================== DAILY P&L BAR CHART =====================
+            # ===================== DAILY P&L BAR CHART (GREEN/RED) =====================
 
-            st.subheader("Daily P&L")
+            st.subheader("Daily P&L (₹)")
 
             daily_df_plot = daily_df.copy()
             daily_df_plot["Date"] = daily_df_plot.index.date
+            daily_df_plot["Positive"] = daily_df_plot["DayPnL"] >= 0
 
             fig_bar = px.bar(
                 daily_df_plot,
                 x="Date",
                 y="DayPnL",
-                color=(daily_df_plot["DayPnL"] >= 0),
+                color="Positive",
                 color_discrete_map={True: "green", False: "red"},
-                labels={"DayPnL": "P&L", "Date": "Date"},
+                labels={"DayPnL": "P&L (₹)", "Date": "Date"},
             )
             fig_bar.update_layout(showlegend=False)
             st.plotly_chart(fig_bar, use_container_width=True)
 
-            # ===================== DAY-WISE HEATMAP =====================
+            # ===================== YEAR → MONTH → DAILY P&L BREAKDOWN =====================
 
-            st.subheader("Daywise Breakdown (Heatmap)")
+            st.subheader("Year / Month / Daily P&L Breakdown (₹)")
 
-            heat_df = daily_df.copy()
-            heat_df["Date"] = heat_df.index
-            heat_df["Month"] = heat_df.index.to_period("M").astype(str)
-            heat_df["DayOfMonth"] = heat_df.index.day
+            if not daily_df.empty:
+                daily_df_break = daily_df.copy()
+                daily_df_break["Year"] = daily_df_break.index.year
+                daily_df_break["Month"] = daily_df_break.index.month
+                daily_df_break["Day"] = daily_df_break.index.day
 
-            fig_heat = px.density_heatmap(
-                heat_df,
-                x="DayOfMonth",
-                y="Month",
-                z="DayPnL",
-                color_continuous_scale="RdYlGn",
-                labels={"DayPnL": "P&L"},
-            )
-            st.plotly_chart(fig_heat, use_container_width=True)
+                years = sorted(daily_df_break["Year"].unique())
+
+                for y in years:
+                    with st.expander(f"Year {y}", expanded=(y == years[-1])):
+                        df_year = daily_df_break[daily_df_break["Year"] == y]
+                        months = sorted(df_year["Month"].unique())
+
+                        for m in months:
+                            month_name = calendar.month_abbr[m]
+                            df_month = df_year[df_year["Month"] == m].copy()
+                            df_month["Date"] = df_month.index.date
+                            df_month["Positive"] = df_month["DayPnL"] >= 0
+
+                            st.markdown(f"**{month_name} {y}**")
+
+                            fig_month = px.bar(
+                                df_month,
+                                x="Date",
+                                y="DayPnL",
+                                color="Positive",
+                                color_discrete_map={True: "green", False: "red"},
+                                labels={"DayPnL": "P&L (₹)", "Date": "Date"},
+                            )
+                            fig_month.update_layout(showlegend=False, height=250)
+                            st.plotly_chart(fig_month, use_container_width=True)
+            else:
+                st.info("No daily P&L data to show.")
 
             # ===================== TRANSACTION DETAILS =====================
 
             st.subheader("Transaction Details")
 
             trades_show = trades_df.copy()
-            trades_show["GrossPnL_pct"] = trades_show["Return %"]
+            trades_show["GrossPnL_pct"] = trades_show["GrossReturn"] * 100.0
             trades_show["ExitDate"] = trades_show["Exit Time"].dt.date
 
             rows_per_page = 20
@@ -680,7 +699,8 @@ def main():
                         "Entry Price",
                         "Exit Price",
                         "PnL Points",
-                        "Return %",
+                        "MoneyPnL",
+                        "GrossPnL_pct",
                         "Exit Reason",
                     ]
                 ],
