@@ -7,3 +7,4 @@ tensorflow>=2.14.0
 xgboost>=2.0.0
 openpyxl
 pyarrow
+fyers_apiv3
