@@ -249,12 +249,10 @@ def backtest_ma_crossover(
                 hit_tp = bar_high >= tp_price
                 hit_sl = bar_low <= sl_price
             else:  # short
-                # For short: TP is move down to tp_price, SL is move up to sl_price
                 hit_tp = bar_low <= tp_price
                 hit_sl = bar_high >= sl_price
 
             if hit_sl and hit_tp:
-                # conservative: SL first
                 exit_price = sl_price
                 exit_reason = "SL&TP same bar (SL priority)"
             elif hit_tp:
@@ -288,12 +286,11 @@ def backtest_ma_crossover(
                 )
                 in_trade = False
                 entry_price = entry_time = tp_price = sl_price = trade_date = direction = None
-                continue  # go to next bar
+                continue
 
         # ---- New entries when flat ----
         if not in_trade:
-            # Bullish signal_prev -> go LONG
-            if signal_prev == 1:
+            if signal_prev == 1:  # bullish -> long
                 entry_price = row["Open"]
                 entry_time = ts
                 trade_date = ts.date()
@@ -301,8 +298,7 @@ def backtest_ma_crossover(
                 tp_price, sl_price = calc_level(entry_price, tp_type, tp_value, direction)
                 in_trade = True
 
-            # Bearish signal_prev -> go SHORT
-            elif signal_prev == -1:
+            elif signal_prev == -1:  # bearish -> short
                 entry_price = row["Open"]
                 entry_time = ts
                 trade_date = ts.date()
@@ -414,7 +410,6 @@ def summarize_backtest(trades_df, daily_equity, initial_capital=100000, trading_
         summary["avg_loss_pct"] = avg_loss * 100 if not np.isnan(avg_loss) else np.nan
         summary["profit_factor"] = profit_factor
 
-        # Long/short split
         long_trades = trades_df[trades_df["Direction"] == "LONG"]
         short_trades = trades_df[trades_df["Direction"] == "SHORT"]
 
@@ -526,7 +521,7 @@ def main():
         resolution = st.sidebar.selectbox(
             "Resolution (Timeframe)",
             ["1", "2", "3", "5", "10", "15", "20", "30", "60", "120", "240", "D"],
-            index=9,  # 60m
+            index=9,
         )
 
         st.sidebar.markdown("---")
@@ -583,11 +578,11 @@ def main():
                     st.warning("No trades generated with selected parameters.")
                     return
 
-                # Convert points to money and compute GrossReturn on capital
+                # PnL in money & GrossReturn on capital
                 trades_df["MoneyPnL"] = trades_df["PnL Points"] * lot_size
                 trades_df["GrossReturn"] = trades_df["MoneyPnL"] / initial_capital  # decimal
 
-                # Per-bar money PnL (₹), assign at exit bars
+                # per-bar money PnL at exit bars
                 pnl_series = pd.Series(0.0, index=price_df.index)
                 for _, tr in trades_df.iterrows():
                     exit_time = tr["Exit Time"]
@@ -670,38 +665,22 @@ def main():
                 st.metric("Max Loss (Day, ₹)", f"{max_loss_day:,.2f}")
                 st.metric("Avg P&L / Day (₹)", f"{avg_per_day:,.2f}")
 
-            # Extra row for long/short split
+            # Long vs Short split
             st.markdown("#### Long vs Short Split")
             c5, c6, c7 = st.columns(3)
             with c5:
                 st.metric("Long Trades", summary.get("long_trades", 0))
-                st.metric(
-                    "Long Win Rate (%)",
-                    f"{summary.get('long_win_rate_pct', float('nan')):.2f}"
-                    if not np.isnan(summary.get("long_win_rate_pct", float("nan")))
-                    else "NA",
-                )
+                lw = summary.get("long_win_rate_pct", float("nan"))
+                st.metric("Long Win Rate (%)", f"{lw:.2f}" if not np.isnan(lw) else "NA")
             with c6:
                 st.metric("Short Trades", summary.get("short_trades", 0))
-                st.metric(
-                    "Short Win Rate (%)",
-                    f"{summary.get('short_win_rate_pct', float('nan')):.2f}"
-                    if not np.isnan(summary.get("short_win_rate_pct", float("nan")))
-                    else "NA",
-                )
+                sw = summary.get("short_win_rate_pct", float("nan"))
+                st.metric("Short Win Rate (%)", f"{sw:.2f}" if not np.isnan(sw) else "NA")
             with c7:
-                st.metric(
-                    "Long Total Return (%)",
-                    f"{summary.get('long_total_return_pct', float('nan')):.2f}"
-                    if not np.isnan(summary.get("long_total_return_pct", float("nan")))
-                    else "NA",
-                )
-                st.metric(
-                    "Short Total Return (%)",
-                    f"{summary.get('short_total_return_pct', float('nan')):.2f}"
-                    if not np.isnan(summary.get("short_total_return_pct", float("nan")))
-                    else "NA",
-                )
+                ltr = summary.get("long_total_return_pct", float("nan"))
+                strr = summary.get("short_total_return_pct", float("nan"))
+                st.metric("Long Total Return (%)", f"{ltr:.2f}" if not np.isnan(ltr) else "NA")
+                st.metric("Short Total Return (%)", f"{strr:.2f}" if not np.isnan(strr) else "NA")
 
             st.markdown("---")
 
@@ -737,7 +716,9 @@ def main():
                 years = sorted(daily_df_break["Year"].unique())
 
                 for y in years:
-                    with st.expander(f"Year {y}", expanded=(y == years[-1])):
+                    # FIX: expanded expects a single bool, not an array
+                    expanded_flag = bool(y == years[-1])
+                    with st.expander(f"Year {y}", expanded=expanded_flag):
                         df_year = daily_df_break[daily_df_break["Year"] == y]
                         months = sorted(df_year["Month"].unique())
 
